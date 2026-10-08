@@ -2,7 +2,7 @@
 
 一个使用 Rust 编写的 Session Vanity ID 生成器。
 
-通过多线程不断生成 Session Account ID，并检查是否匹配 `p.txt` 中指定的前缀。命中后会自动保存 Account ID、恢复短语和 Seed。
+通过多线程不断生成 Session Account ID，并检查是否匹配 `p.txt` 中指定的模式。命中后会自动保存 Account ID、恢复短语和 Seed。
 
 ## 编译
 
@@ -31,12 +31,13 @@ target/release/session-id-gen.exe
 
 ## 使用
 
-准备一个 `p.txt`，每行填写一个希望匹配的 Session ID 前缀，例如：
+准备一个 `p.txt`，每行填写一个希望匹配的 Session ID 模式，例如：
 
 ```text
-05AB
-05CD
-05EF
+05AB // 匹配前缀
+05CD.. // 同上，匹配前缀
+..EF // 匹配后缀
+..GH.. //任意位置匹配
 ```
 
 然后准备 Session 使用的 `english.json` 单词表。
@@ -60,7 +61,7 @@ Windows：
 | 参数 | 说明 |
 | ------------ | -------------- |
 | `--threads` | 使用的线程数量 |
-| `--patterns` | 目标前缀文件 |
+| `--patterns` | 目标模式文件 |
 | `--output` | 命中结果的保存目录 |
 | `--wordlist` | Session 助记词单词表 |
 
