@@ -27,7 +27,7 @@ struct Args {
     #[arg(short = 't', long, default_value_t = 1)]
     threads: usize,
 
-    /// Pattern file, one prefix per line
+    /// Pattern file, one pattern per line
     #[arg(short, long)]
     patterns: PathBuf,
 
@@ -36,17 +36,52 @@ struct Args {
     output: PathBuf,
 
     /// Session mnemonic word list
-    #[arg(
-        long,
-        default_value = "english.json"
-    )]
+    #[arg(long, default_value = "english.json")]
     wordlist: PathBuf,
 }
 
-#[derive(Clone)]
+/// A parsed vanity pattern.
+#[derive(Clone, Debug)]
+enum Pattern {
+    /// 05AB -> 05AB...
+    Prefix(String),
+
+    /// ..AB -> ...AB
+    Suffix(String),
+
+    /// ..AB.. -> ...AB...
+    Contains(String),
+}
+
+impl Pattern {
+    fn display(&self) -> String {
+        match self {
+            Pattern::Prefix(value) => value.clone(),
+            Pattern::Suffix(value) => format!("..{}", value),
+            Pattern::Contains(value) => format!("..{}..", value),
+        }
+    }
+
+    /// Check whether this pattern matches a Session ID.
+    fn matches(&self, session_id: &str) -> bool {
+        match self {
+            Pattern::Prefix(value) => {
+                session_id.starts_with(value)
+            }
+
+            Pattern::Suffix(value) => {
+                session_id.ends_with(value)
+            }
+
+            Pattern::Contains(value) => {
+                session_id.contains(value)
+            }
+        }
+    }
+}
+
 struct MatchResult {
     session_id: String,
-    mnemonic: String,
     seed: [u8; 16],
 }
 
@@ -101,9 +136,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
      */
     fs::create_dir_all(&args.output)?;
 
-    /*
-     * Shared state.
-     */
     let patterns = Arc::new(patterns);
     let words = Arc::new(words);
     let output = Arc::new(args.output);
@@ -133,7 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Patterns:");
 
     for pattern in patterns.iter() {
-        println!("  {}", pattern);
+        println!("  {}", pattern.display());
     }
 
     println!();
@@ -175,7 +207,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(Duration::from_secs(1));
 
         let count = attempts.load(Ordering::Relaxed);
-
         let elapsed = start.elapsed().as_secs_f64();
 
         let speed = if elapsed > 0.0 {
@@ -224,69 +255,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Worker thread.
 fn worker_loop(
     words: &[String],
-    patterns: &[String],
+    patterns: &[Pattern],
     output: &Path,
     stop: &AtomicBool,
     attempts: &AtomicU64,
 ) {
     while !stop.load(Ordering::Relaxed) {
         /*
-         * Generate one Session account.
+         * Generate only the Session ID.
+         *
+         * The mnemonic is generated only after a match,
+         * which avoids a significant amount of unnecessary work.
          */
-        if let Some(account) = generate_account(words) {
-            attempts.fetch_add(1, Ordering::Relaxed);
+        let account = generate_account();
 
-            /*
-             * Check every pattern.
-             */
-            for pattern in patterns {
-                if account.session_id.starts_with(pattern) {
-                    match save_match(output, &account) {
-                        Ok(true) => {
-                            println!(
-                                "\n[MATCH] {} -> {}",
-                                pattern,
-                                account.session_id
-                            );
-                        }
+        attempts.fetch_add(1, Ordering::Relaxed);
 
-                        Ok(false) => {
-                            /*
-                             * The account was already saved.
-                             */
-                        }
+        /*
+         * Check every pattern.
+         */
+        for pattern in patterns {
+            if pattern.matches(&account.session_id) {
+                /*
+                 * Generate the mnemonic only when we actually
+                 * found a matching Session ID.
+                 */
+                let mnemonic =
+                    encode_session_mnemonic(&account.seed, words);
 
-                        Err(error) => {
-                            eprintln!(
-                                "\n[ERROR] Failed to save {}: {}",
-                                account.session_id,
-                                error
-                            );
-                        }
+                let account = MatchResultWithMnemonic {
+                    session_id: account.session_id.clone(),
+                    mnemonic,
+                    seed: account.seed,
+                };
+
+                match save_match(output, &account) {
+                    Ok(true) => {
+                        println!(
+                            "\n[MATCH] {} -> {}",
+                            pattern.display(),
+                            account.session_id
+                        );
+                    }
+
+                    Ok(false) => {
+                        /*
+                         * The account was already saved.
+                         */
+                    }
+
+                    Err(error) => {
+                        eprintln!(
+                            "\n[ERROR] Failed to save {}: {}",
+                            account.session_id,
+                            error
+                        );
                     }
                 }
             }
-        } else {
-            attempts.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
-/// Generate a Session account.
-fn generate_account(words: &[String]) -> Option<MatchResult> {
+/// Account information used during the search.
+struct MatchResultWithMnemonic {
+    session_id: String,
+    mnemonic: String,
+    seed: [u8; 16],
+}
+
+/// Generate a Session account ID.
+///
+/// The mnemonic is intentionally NOT generated here.
+fn generate_account() -> MatchResult {
     /*
      * Session uses a 16-byte random seed.
      */
     let random = sodiumoxide::randombytes::randombytes(16);
 
     let mut seed = [0u8; 16];
-
     seed.copy_from_slice(&random);
-
-    /*
-     * Generate the Session recovery phrase.
-     */
-    let mnemonic = encode_session_mnemonic(&seed, words);
 
     /*
      * Session pads the 16-byte seed to 32 bytes
@@ -297,7 +345,8 @@ fn generate_account(words: &[String]) -> Option<MatchResult> {
     sodium_seed_bytes[..16].copy_from_slice(&seed);
 
     let sodium_seed =
-        ed25519::Seed::from_slice(&sodium_seed_bytes)?;
+        ed25519::Seed::from_slice(&sodium_seed_bytes)
+            .expect("32-byte seed must always be valid");
 
     /*
      * Generate Ed25519 key pair.
@@ -309,19 +358,15 @@ fn generate_account(words: &[String]) -> Option<MatchResult> {
      * Convert Ed25519 public key to X25519 public key.
      */
     let x_public =
-        ed25519::to_curve25519_pk(&ed_public).ok()?;
+        ed25519::to_curve25519_pk(&ed_public)
+            .expect("valid Ed25519 public key must convert");
 
     /*
      * Session Account ID:
      *
      *     05 + X25519 public key
      *
-     * 32 bytes public key = 64 hex characters.
-     * 05 = 2 characters.
-     *
-     * Total:
-     *
-     *     66 hexadecimal characters
+     * 66 hexadecimal characters in total.
      */
     let mut session_id = String::with_capacity(66);
 
@@ -331,11 +376,10 @@ fn generate_account(words: &[String]) -> Option<MatchResult> {
         session_id.push_str(&format!("{:02X}", byte));
     }
 
-    Some(MatchResult {
+    MatchResult {
         session_id,
-        mnemonic,
         seed,
-    })
+    }
 }
 
 /// Encode Session's 16-byte seed into a 13-word mnemonic.
@@ -385,15 +429,12 @@ fn encode_session_mnemonic(
     let mut checksum_input = String::with_capacity(36);
 
     for word in &result {
-        if word.len() < 3 {
-            continue;
+        if word.len() >= 3 {
+            checksum_input.push_str(&word[..3]);
         }
-
-        checksum_input.push_str(&word[..3]);
     }
 
     let mut hasher = Hasher::new();
-
     hasher.update(checksum_input.as_bytes());
 
     let checksum = hasher.finalize();
@@ -416,15 +457,6 @@ fn load_wordlist(
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let data = fs::read_to_string(path)?;
 
-    /*
-     * Session's english.json is a JSON array:
-     *
-     * [
-     *   "word1",
-     *   "word2",
-     *   ...
-     * ]
-     */
     let words: Vec<String> =
         serde_json::from_str(&data)?;
 
@@ -439,20 +471,26 @@ fn load_wordlist(
     Ok(words)
 }
 
-/// Load vanity prefixes.
+/// Load and validate vanity patterns.
+///
+/// Supported syntax:
+///
+///     05AB       Prefix
+///     05AB..     Prefix
+///     ..AB       Suffix
+///     ..AB..     Contains
 fn load_patterns(
     path: &Path,
-) -> io::Result<Vec<String>> {
+) -> io::Result<Vec<Pattern>> {
     let file = File::open(path)?;
-
     let reader = BufReader::new(file);
 
     let mut patterns = Vec::new();
 
-    for line in reader.lines() {
-        let line = line?;
-
-        let line = line.trim();
+    for (line_number, line) in reader.lines().enumerate() {
+        let line_number = line_number + 1;
+        let original = line?;
+        let line = original.trim();
 
         /*
          * Ignore empty lines.
@@ -468,55 +506,182 @@ fn load_patterns(
             continue;
         }
 
-        /*
-         * Session IDs use hexadecimal representation.
-         */
-        let pattern = line.to_ascii_uppercase();
+        let mut pattern = line.to_ascii_uppercase();
 
         /*
-         * Session Account IDs start with 05.
-         */
-        if !pattern.starts_with("05") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "invalid Session ID prefix: {}",
-                    line
-                ),
-            ));
-        }
-
-        /*
-         * Make sure the pattern is hexadecimal.
+         * Only these characters are allowed:
+         *
+         *   0-9
+         *   A-F
+         *   .
          */
         if !pattern
             .chars()
-            .all(|c| c.is_ascii_hexdigit())
+            .all(|c| c.is_ascii_hexdigit() || c == '.')
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "pattern contains non-hexadecimal characters: {}",
-                    line
-                ),
-            ));
+            eprintln!(
+                "[WARNING] line {} ignored: '{}' \
+                 contains invalid characters. \
+                 Only 0-9, A-F and '.' are allowed.",
+                line_number,
+                original
+            );
+            continue;
         }
 
         /*
-         * Maximum length of a Session ID is 66
-         * hexadecimal characters.
+         * Dots are only meaningful at the beginning/end.
+         *
+         * Examples:
+         *
+         *   05AB..   valid
+         *   ..AB     valid
+         *   ..AB..   valid
+         *
+         *   05..AB   invalid
+         *   AB..CD   invalid
          */
-        if pattern.len() > 66 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "pattern is longer than a Session ID: {}",
-                    line
-                ),
-            ));
+        let leading_dots = pattern.starts_with("..");
+        let trailing_dots = pattern.ends_with("..");
+
+        let core = if leading_dots && trailing_dots {
+            &pattern[2..pattern.len() - 2]
+        } else if leading_dots {
+            &pattern[2..]
+        } else if trailing_dots {
+            &pattern[..pattern.len() - 2]
+        } else {
+            &pattern[..]
+        };
+
+        /*
+         * A pattern must contain actual hexadecimal characters.
+         */
+        if core.is_empty() {
+            eprintln!(
+                "[WARNING] line {} ignored: '{}' \
+                 does not contain a hexadecimal pattern.",
+                line_number,
+                original
+            );
+            continue;
         }
 
-        patterns.push(pattern);
+        /*
+         * No single '.' is allowed.
+         *
+         * We only support '..' as the wildcard marker.
+         */
+        if pattern.contains('.') {
+            let dot_count = pattern.matches('.').count();
+
+            if dot_count != 2
+                && dot_count != 4
+            {
+                eprintln!(
+                    "[WARNING] line {} ignored: '{}' \
+                     uses an invalid '.' wildcard. \
+                     Use '..AB', 'AB..', or '..AB..'.",
+                    line_number,
+                    original
+                );
+                continue;
+            }
+        }
+
+        /*
+         * Dots must only appear at the beginning or end.
+         */
+        let inner = if leading_dots {
+            &pattern[2..]
+        } else {
+            &pattern[..]
+        };
+
+        let inner = if inner.ends_with("..") {
+            &inner[..inner.len() - 2]
+        } else {
+            inner
+        };
+
+        if inner.contains('.') {
+            eprintln!(
+                "[WARNING] line {} ignored: '{}' \
+                 has '..' in the middle. \
+                 Wildcards are only allowed at the beginning/end.",
+                line_number,
+                original
+            );
+            continue;
+        }
+
+        /*
+         * The core must be hexadecimal.
+         */
+        if !core
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+        {
+            eprintln!(
+                "[WARNING] line {} ignored: '{}' \
+                 contains invalid hexadecimal characters.",
+                line_number,
+                original
+            );
+            continue;
+        }
+
+        /*
+         * Session IDs are exactly 66 hexadecimal characters.
+         */
+        if core.len() > 66 {
+            eprintln!(
+                "[WARNING] line {} ignored: '{}' \
+                 is longer than a Session ID.",
+                line_number,
+                original
+            );
+            continue;
+        }
+
+        /*
+         * A prefix must describe an actual Session ID.
+         *
+         * Every Session Account ID starts with 05.
+         */
+        if !leading_dots && !core.starts_with("05") {
+            eprintln!(
+                "[WARNING] line {} ignored: '{}' \
+                 is an invalid prefix. \
+                 Session Account IDs must start with 05.",
+                line_number,
+                original
+            );
+            continue;
+        }
+
+        /*
+         * A prefix/suffix/contains pattern with an odd number
+         * of hexadecimal characters can never match a byte-aligned
+         * representation if it is intended to describe complete
+         * bytes.
+         *
+         * We do NOT reject it because hexadecimal prefixes such as
+         * 05A are perfectly valid string prefixes.
+         */
+
+        /*
+         * Construct the parsed pattern.
+         */
+        let parsed = if leading_dots && trailing_dots {
+            Pattern::Contains(core.to_string())
+        } else if leading_dots {
+            Pattern::Suffix(core.to_string())
+        } else {
+            Pattern::Prefix(core.to_string())
+        };
+
+        patterns.push(parsed);
     }
 
     Ok(patterns)
@@ -525,21 +690,17 @@ fn load_patterns(
 /// Save a matched Session account.
 fn save_match(
     output: &Path,
-    account: &MatchResult,
+    account: &MatchResultWithMnemonic,
 ) -> io::Result<bool> {
     /*
-     * Each account gets its own directory:
-     *
-     * found/
-     *   └── SessionID/
+     * Each account gets its own directory.
      */
     let directory =
         output.join(&account.session_id);
 
     /*
-     * create_dir() instead of create_dir_all()
-     * allows us to determine whether another worker
-     * has already saved the same account.
+     * create_dir() allows us to determine whether
+     * another worker already saved this account.
      */
     match fs::create_dir(&directory) {
         Ok(_) => {}
@@ -632,13 +793,15 @@ fn save_match(
 
 /// Convert bytes to lowercase hexadecimal.
 fn hex_encode(data: &[u8]) -> String {
+    const HEX: &[u8; 16] =
+        b"0123456789abcdef";
+
     let mut result =
         String::with_capacity(data.len() * 2);
 
-    for byte in data {
-        result.push_str(
-            &format!("{:02x}", byte)
-        );
+    for &byte in data {
+        result.push(HEX[(byte >> 4) as usize] as char);
+        result.push(HEX[(byte & 0x0f) as usize] as char);
     }
 
     result
