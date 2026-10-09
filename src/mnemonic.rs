@@ -1,10 +1,6 @@
 use crc32fast::Hasher;
-use serde::Deserialize;
 
 use std::{fs, path::Path};
-
-#[derive(Deserialize)]
-struct WordList(Vec<String>);
 
 /// Encode Session's 16-byte seed into a 13-word mnemonic.
 pub(crate) fn encode_session_mnemonic(
