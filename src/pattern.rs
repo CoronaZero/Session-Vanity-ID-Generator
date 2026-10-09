@@ -79,7 +79,7 @@ pub(crate) fn load_patterns(
             continue;
         }
 
-        let mut pattern = line.to_ascii_uppercase();
+        let pattern = line.to_ascii_uppercase();
 
         /*
          * Only these characters are allowed:
